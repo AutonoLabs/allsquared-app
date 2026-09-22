@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      legacy: ${{ steps.filter.outputs.legacy }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            legacy:
+              - 'legacy-app/**'
+              - '.github/workflows/ci.yml'
+
+  checker:
+    name: Checker — test & build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: checker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: checker/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  # Frozen product — only runs when legacy-app/ (or this workflow) changes.
+  # Active product is checker/; see allsquared-plans/for-repo/STATE.md.
+  legacy-app:
+    name: Legacy app — typecheck, test & build
+    needs: changes
+    if: needs.changes.outputs.legacy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: legacy-app
+    env:
+      DATABASE_URL: postgresql://test:test@localhost:5432/test
+      CLERK_SECRET_KEY: sk_test_ci_dummy
+      VITE_CLERK_PUBLISHABLE_KEY: pk_test_ci_dummy
+      STRIPE_SECRET_KEY: sk_test_ci_dummy
+      STRIPE_PUBLISHABLE_KEY: pk_test_ci_dummy
+      STRIPE_WEBHOOK_SECRET: whsec_ci_dummy
+      OPENAI_API_KEY: sk-ci-dummy
+      JWT_SECRET: ci_dummy_jwt_secret_at_least_32_chars_long_xxxxx
+      VITE_APP_TITLE: AllSquared
+      VITE_APP_ID: ci
+      VITE_APP_LOGO: /logo.png
+      VITE_OAUTH_PORTAL_URL: https://example.com
+      OAUTH_SERVER_URL: https://example.com
+      OWNER_OPEN_ID: ci
+      OWNER_NAME: CI
+      BUILT_IN_FORGE_API_URL: https://example.com
+      BUILT_IN_FORGE_API_KEY: ci_dummy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: legacy-app/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm check
+
+      - name: Test
+        run: pnpm test -- --reporter=verbose
+        continue-on-error: true
+
+      - name: Build
+        run: pnpm build
