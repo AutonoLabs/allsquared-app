@@ -1,4 +1,5 @@
 import { Resend } from "resend";
+import { checkRateLimit, getClientIp } from "@/lib/rateLimit";
 
 type LeadPayload = {
   email: string;
@@ -10,6 +11,7 @@ type LeadPayload = {
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_EMAIL_LEN = 254; // RFC 5321 practical limit
 const MAX_NOTIFIED_SUM_PENCE = 100_000_000_00; // £1,000,000 — anything above is implausible for a subbie
+const MAX_BODY_BYTES = 4_096;
 
 function isValidPayload(body: unknown): body is LeadPayload {
   if (typeof body !== "object" || body === null) return false;
@@ -27,6 +29,41 @@ function isValidPayload(body: unknown): body is LeadPayload {
       candidate.likelyValid
     )
   );
+}
+
+function hasJsonContentType(request: Request): boolean {
+  const contentType = request.headers.get("content-type");
+  if (!contentType) return false;
+  const normalized = contentType.split(";")[0]?.trim().toLowerCase();
+  return normalized === "application/json";
+}
+
+function contentLengthTooLarge(request: Request): boolean {
+  const contentLengthHeader = request.headers.get("content-length");
+  if (!contentLengthHeader) return false;
+  const contentLength = Number.parseInt(contentLengthHeader, 10);
+  return Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES;
+}
+
+type ReadJsonBodyResult =
+  | { ok: true; body: unknown }
+  | { ok: false; reason: "too_large" | "invalid_json" };
+
+async function readJsonBody(request: Request): Promise<ReadJsonBodyResult> {
+  if (contentLengthTooLarge(request)) {
+    return { ok: false, reason: "too_large" };
+  }
+
+  const raw = await request.text();
+  if (raw.length > MAX_BODY_BYTES) {
+    return { ok: false, reason: "too_large" };
+  }
+
+  try {
+    return { ok: true, body: JSON.parse(raw) as unknown };
+  } catch {
+    return { ok: false, reason: "invalid_json" };
+  }
 }
 
 /**
@@ -48,16 +85,35 @@ function persistLeadToLog(payload: LeadPayload): void {
 }
 
 export async function POST(request: Request): Promise<Response> {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
+  const rateLimit = checkRateLimit(getClientIp(request));
+  if (!rateLimit.allowed) {
+    return Response.json(
+      { ok: false, error: "rate limit exceeded" },
+      {
+        status: 429,
+        headers: { "Retry-After": String(rateLimit.retryAfterSeconds) },
+      }
+    );
+  }
+
+  if (!hasJsonContentType(request)) {
+    return Response.json({ ok: false, error: "invalid payload" }, { status: 415 });
+  }
+
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) {
+    const tooLarge = parsed.reason === "too_large";
+    return Response.json(
+      { ok: false, error: tooLarge ? "payload too large" : "invalid payload" },
+      { status: tooLarge ? 413 : 400 }
+    );
+  }
+
+  if (!isValidPayload(parsed.body)) {
     return Response.json({ ok: false, error: "invalid payload" }, { status: 400 });
   }
 
-  if (!isValidPayload(body)) {
-    return Response.json({ ok: false, error: "invalid payload" }, { status: 400 });
-  }
+  const body = parsed.body;
 
   // Always persist first — never lose a lead to an email failure.
   persistLeadToLog(body);
